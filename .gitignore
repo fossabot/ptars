@@ -1,6 +1,7 @@
 /target
 /env
-venv
+/venv
+/benv
 __pycache__
 *.pyc
 /.env

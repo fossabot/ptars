@@ -43,6 +43,11 @@ Make sure to install the release version of ptars.
 The locally built version is much slower.
 
 ```shell
+deactivate
+python3 -m venv benv
+source benv/bin/activate
+pip install pytest-benchmark ptars protarrow grpcio-tools
+python scripts/protoc.py
 pytest python/test/benchmark --benchmark-name=short --benchmark-columns=mean --benchmark-sort=name
 ```
 

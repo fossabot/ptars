@@ -2,404 +2,316 @@ use crate::{converter, CE_OFFSET};
 use arrow::array::ArrayData;
 use arrow::buffer::{Buffer, NullBuffer};
 use arrow::datatypes::ArrowNativeType;
-use arrow_array::builder::{ArrayBuilder, BinaryBuilder, Int32Builder, StringBuilder};
-use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type, UInt32Type, UInt64Type};
+use arrow_array::builder::{
+    ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Float32Builder, Float64Builder,
+    Int32Builder, Int64Builder, ListBuilder, StringBuilder, StructBuilder,
+    TimestampNanosecondBuilder, UInt32Builder, UInt64Builder,
+};
+use arrow_array::types::{
+    Date32Type, Float32Type, Float64Type, Int32Type, Int64Type, TimestampNanosecondType,
+    UInt32Type, UInt64Type,
+};
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BinaryArray, BooleanArray, Date32Array, Float32Array,
     Float64Array, Int32Array, Int64Array, ListArray, PrimitiveArray, RecordBatch, Scalar,
     StringArray, StructArray, TimestampNanosecondArray, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::Datelike;
 use prost::Message;
 use prost_reflect::{DynamicMessage, FieldDescriptor, Kind, MessageDescriptor, Value};
 use std::iter::zip;
 use std::sync::Arc;
 
-fn singular_field_to_array(
-    field_descriptor: &FieldDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<Arc<dyn Array>, &'static str> {
-    match field_descriptor.kind() {
-        Kind::Double => Ok(read_primitive_type::<Float64Type, Float64Array>(
-            messages,
-            field_descriptor,
-            &Value::as_f64,
-        )),
-        Kind::Float => Ok(read_primitive_type::<Float32Type, Float32Array>(
-            messages,
-            field_descriptor,
-            &Value::as_f32,
-        )),
-        Kind::Sfixed32 | Kind::Sint32 | Kind::Int32 => {
-            Ok(read_primitive_type::<Int32Type, Int32Array>(
-                messages,
-                field_descriptor,
-                &Value::as_i32,
-            ))
-        }
-        Kind::Sfixed64 | Kind::Sint64 | Kind::Int64 => {
-            Ok(read_primitive_type::<Int64Type, Int64Array>(
-                messages,
-                field_descriptor,
-                &Value::as_i64,
-            ))
-        }
-        Kind::Fixed32 | Kind::Uint32 => Ok(read_primitive_type::<UInt32Type, UInt32Array>(
-            messages,
-            field_descriptor,
-            &Value::as_u32,
-        )),
-        Kind::Fixed64 | Kind::Uint64 => Ok(read_primitive_type::<UInt64Type, UInt64Array>(
-            messages,
-            field_descriptor,
-            &Value::as_u64,
-        )),
-        Kind::Bool => Ok(read_primitive::<bool, BooleanArray>(
-            messages,
-            field_descriptor,
-            &Value::as_bool,
-            false,
-        )),
-        Kind::String => {
-            let mut string_builder = StringBuilder::new();
-            for message in messages {
-                string_builder.append_value(message.get_field(field_descriptor).as_str().unwrap());
+fn field_descriptor_to_data_type(field: &FieldDescriptor) -> DataType {
+    let inner_type = match field.kind() {
+        Kind::Message(md) => match md.full_name() {
+            "google.protobuf.Timestamp" => {
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
             }
-            Ok(Arc::new(string_builder.finish()))
-        }
-        Kind::Bytes => {
-            let mut binary_builder = BinaryBuilder::new();
-            for message in messages {
-                binary_builder.append_value(message.get_field(field_descriptor).as_bytes().unwrap())
+            "google.type.Date" => DataType::Date32,
+            _ => {
+                let fields: Vec<Field> = md
+                    .fields()
+                    .map(|f| {
+                        Field::new(
+                            f.name(),
+                            field_descriptor_to_data_type(&f),
+                            f.supports_presence(),
+                        )
+                    })
+                    .collect();
+                DataType::Struct(fields.into())
             }
-            Ok(Arc::new(binary_builder.finish()))
-        }
-        Kind::Message(message_descriptor) => Ok(nested_messages_to_array(
-            field_descriptor,
-            &message_descriptor,
-            messages,
-        )),
-        Kind::Enum(_) => Ok(read_primitive::<i32, Int32Array>(
-            messages,
-            field_descriptor,
-            &Value::as_enum_number,
-            0,
-        )),
-    }
-}
-
-fn read_i32(message: &DynamicMessage, field_descriptor: &FieldDescriptor) -> i32 {
-    message.get_field(field_descriptor).as_i32().unwrap()
-}
-
-fn convert_date(
-    messages: &Vec<DynamicMessage>,
-    is_valid: &Vec<bool>,
-    message_descriptor: &MessageDescriptor,
-) -> Arc<Date32Array> {
-    let year_descriptor = message_descriptor.get_field_by_name("year").unwrap();
-    let month_descriptor = message_descriptor.get_field_by_name("month").unwrap();
-    let day_descriptor = message_descriptor.get_field_by_name("day").unwrap();
-
-    let mut builder = Int32Builder::new();
-    for (message, message_valid) in zip(messages, is_valid) {
-        if *message_valid {
-            let year: i32 = read_i32(message, &year_descriptor);
-            let month: i32 = read_i32(message, &month_descriptor);
-            let day: i32 = read_i32(message, &day_descriptor);
-
-            if (year == 0) && (month == 0) && (day == 0) {
-                builder.append_value(0)
-            } else {
-                builder.append_value(
-                    chrono::NaiveDate::from_ymd_opt(
-                        year,
-                        u32::try_from(month).unwrap(),
-                        u32::try_from(day).unwrap(),
-                    )
-                    .unwrap()
-                    .num_days_from_ce()
-                        - CE_OFFSET,
-                )
-            }
-        } else {
-            builder.append_null()
-        }
-    }
-    Arc::new(builder.finish().reinterpret_cast())
-}
-
-fn convert_timestamps(
-    arrays: &[(Arc<Field>, Arc<dyn Array>)],
-    is_valid: &[bool],
-) -> Arc<TimestampNanosecondArray> {
-    let scalar: Scalar<PrimitiveArray<Int64Type>> = Int64Array::new_scalar(1_000_000_000);
-    let seconds: Arc<dyn Array> = arrays[0].clone().1;
-    let nanos: Arc<dyn Array> = arrays[1].clone().1;
-    let casted = arrow::compute::kernels::cast(&nanos, &DataType::Int64).unwrap();
-    let multiplied = arrow::compute::kernels::numeric::mul(&seconds, &scalar).unwrap();
-    let total: ArrayRef = arrow::compute::kernels::numeric::add(&multiplied, &casted).unwrap();
-
-    let is_valid_array = BooleanArray::from(is_valid.to_owned());
-    let is_null = arrow::compute::not(&is_valid_array).unwrap();
-    let total_nullable = arrow::compute::nullif(&total, &is_null).unwrap();
-    Arc::new(Int64Array::from(total_nullable.to_data()).reinterpret_cast())
-}
-
-fn nested_messages_to_array(
-    field_descriptor: &FieldDescriptor,
-    message_descriptor: &MessageDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Arc<dyn Array> {
-    let mut nested_messages: Vec<DynamicMessage> = Vec::new();
-    let mut is_valid: Vec<bool> = Vec::new();
-    for message in messages {
-        is_valid.push(message.has_field(field_descriptor));
-        let ee = message.get_field(field_descriptor);
-        let each_value = ee.as_message().unwrap();
-        nested_messages.push(each_value.clone());
-    }
-    if message_descriptor.full_name() == "google.type.Date" {
-        convert_date(&nested_messages, &is_valid, message_descriptor)
-    } else {
-        let arrays: Vec<(Arc<Field>, Arc<dyn Array>)> =
-            fields_to_arrays(&nested_messages, message_descriptor);
-        if arrays.is_empty() {
-            Arc::new(StructArray::new_empty_fields(
-                nested_messages.len(),
-                Some(NullBuffer::from_iter(is_valid)),
-            ))
-        } else if message_descriptor.full_name() == "google.protobuf.Timestamp" {
-            convert_timestamps(&arrays, &is_valid)
-        } else {
-            Arc::new(StructArray::from((arrays, Buffer::from_iter(is_valid))))
-        }
-    }
-}
-
-fn read_primitive_type<T: ArrowPrimitiveType, A: From<Vec<T::Native>> + Array + 'static>(
-    messages: &Vec<DynamicMessage>,
-    field_descriptor: &FieldDescriptor,
-    extractor: &dyn Fn(&Value) -> Option<T::Native>,
-) -> Arc<dyn Array> {
-    read_primitive::<<T as ArrowPrimitiveType>::Native, A>(
-        messages,
-        field_descriptor,
-        extractor,
-        T::default_value(),
-    )
-}
-
-fn read_primitive<'b, T: Clone, A: From<Vec<T>> + Array + 'static>(
-    messages: &'b Vec<DynamicMessage>,
-    field_descriptor: &FieldDescriptor,
-    extractor: &dyn Fn(&Value) -> Option<T>,
-    default: T,
-) -> Arc<dyn Array> {
-    let mut values: Vec<T> = Vec::new();
-    for message in messages {
-        if !field_descriptor.supports_presence() || message.has_field(field_descriptor) {
-            values.push(extractor(&message.get_field(field_descriptor)).unwrap());
-        } else {
-            values.push(default.clone())
-        }
-    }
-    Arc::new(A::from(values))
-}
-
-fn read_repeated_primitive<'b, T, A: From<Vec<T>> + Array>(
-    field_descriptor: &FieldDescriptor,
-    messages: &'b Vec<DynamicMessage>,
-    data_type: DataType,
-    extractor: &dyn Fn(&Value) -> Option<T>,
-) -> Result<Arc<dyn Array>, &'static str> {
-    let mut all_values: Vec<T> = Vec::new();
-    let mut offsets: Vec<i32> = Vec::new();
-    offsets.push(0);
-    for message in messages {
-        if message.has_field(field_descriptor) {
-            let field_value = message.get_field(field_descriptor);
-            println!("{}", field_descriptor.full_name());
-            let field_value_as_list: &[Value] = field_value.as_list().unwrap();
-            for each_value in field_value_as_list {
-                all_values.push(extractor(each_value).unwrap())
-            }
-        }
-        offsets.push(i32::from_usize(all_values.len()).unwrap());
-    }
-    let list_data_type = DataType::List(Arc::new(Field::new("item", data_type, false)));
-    let list_data = ArrayData::builder(list_data_type)
-        .len(messages.len())
-        .add_buffer(Buffer::from_iter(offsets))
-        .add_child_data(A::from(all_values).to_data())
-        .build()
-        .unwrap();
-    Ok(Arc::new(ListArray::from(list_data)))
-}
-
-fn repeated_field_to_array(
-    field_descriptor: &FieldDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<Arc<dyn Array>, &'static str> {
-    match field_descriptor.kind() {
-        Kind::Double => read_repeated_primitive::<f64, Float64Array>(
-            field_descriptor,
-            messages,
-            DataType::Float64,
-            &Value::as_f64,
-        ),
-        Kind::Float => read_repeated_primitive::<f32, Float32Array>(
-            field_descriptor,
-            messages,
-            DataType::Float32,
-            &Value::as_f32,
-        ),
-        Kind::Sfixed32 | Kind::Sint32 | Kind::Int32 => read_repeated_primitive::<i32, Int32Array>(
-            field_descriptor,
-            messages,
-            DataType::Int32,
-            &Value::as_i32,
-        ),
-        Kind::Sfixed64 | Kind::Sint64 | Kind::Int64 => read_repeated_primitive::<i64, Int64Array>(
-            field_descriptor,
-            messages,
-            DataType::Int64,
-            &Value::as_i64,
-        ),
-        Kind::Fixed32 | Kind::Uint32 => read_repeated_primitive::<u32, UInt32Array>(
-            field_descriptor,
-            messages,
-            DataType::UInt32,
-            &Value::as_u32,
-        ),
-        Kind::Fixed64 | Kind::Uint64 => read_repeated_primitive::<u64, UInt64Array>(
-            field_descriptor,
-            messages,
-            DataType::UInt64,
-            &Value::as_u64,
-        ),
-        Kind::Bool => read_repeated_primitive::<bool, BooleanArray>(
-            field_descriptor,
-            messages,
-            DataType::Boolean,
-            &Value::as_bool,
-        ),
-        Kind::String => read_repeated_string(field_descriptor, messages),
-
-        Kind::Bytes => read_repeated_bytes(field_descriptor, messages),
-
-        Kind::Message(message_descriptor) => {
-            read_repeated_messages(field_descriptor, &message_descriptor, messages)
-        }
-
-        Kind::Enum(_) => read_repeated_primitive::<i32, Int32Array>(
-            field_descriptor,
-            messages,
-            DataType::Int32,
-            &Value::as_enum_number,
-        ),
-    }
-}
-
-fn read_repeated_string(
-    field_descriptor: &FieldDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<Arc<dyn Array>, &'static str> {
-    let mut string_builder = StringBuilder::new();
-    let mut offsets: Vec<i32> = Vec::new();
-    offsets.push(0);
-    for message in messages {
-        if message.has_field(field_descriptor) {
-            let each_list = message.get_field(field_descriptor);
-            let values = each_list.as_list().unwrap();
-            for each_value in values {
-                string_builder.append_value(each_value.as_str().unwrap())
-            }
-        }
-        offsets.push(i32::from_usize(string_builder.len()).unwrap());
-    }
-    let list_data_type = DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
-    let list_data = ArrayData::builder(list_data_type)
-        .len(messages.len())
-        .add_buffer(Buffer::from_iter(offsets))
-        .add_child_data(string_builder.finish().to_data())
-        .build()
-        .unwrap();
-    Ok(Arc::new(ListArray::from(list_data)))
-}
-
-fn read_repeated_bytes(
-    field_descriptor: &FieldDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<Arc<dyn Array>, &'static str> {
-    let mut builder = BinaryBuilder::new();
-    let mut offsets: Vec<i32> = Vec::new();
-    offsets.push(0);
-    for message in messages {
-        if message.has_field(field_descriptor) {
-            let each_list = message.get_field(field_descriptor);
-            let values = each_list.as_list().unwrap();
-            for each_value in values {
-                builder.append_value(each_value.as_bytes().unwrap())
-            }
-        }
-        offsets.push(i32::from_usize(builder.len()).unwrap());
-    }
-    let list_data_type = DataType::List(Arc::new(Field::new("item", DataType::Binary, false)));
-    let list_data = ArrayData::builder(list_data_type)
-        .len(messages.len())
-        .add_buffer(Buffer::from_iter(offsets))
-        .add_child_data(builder.finish().to_data())
-        .build()
-        .unwrap();
-    Ok(Arc::new(ListArray::from(list_data)))
-}
-
-fn read_repeated_messages(
-    field_descriptor: &FieldDescriptor,
-    message_descriptor: &MessageDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<Arc<dyn Array>, &'static str> {
-    let mut repeated_messages: Vec<DynamicMessage> = Vec::new();
-    let mut offsets: Vec<i32> = Vec::new();
-    offsets.push(0);
-    for message in messages {
-        for each_message in message.get_field(field_descriptor).as_list().unwrap() {
-            repeated_messages.push(each_message.as_message().unwrap().clone());
-        }
-        offsets.push(i32::from_usize(repeated_messages.len()).unwrap());
-    }
-    let arrays = fields_to_arrays(&repeated_messages, message_descriptor);
-    let struct_array: Arc<StructArray> = if arrays.is_empty() {
-        Arc::new(StructArray::new_empty_fields(repeated_messages.len(), None))
-    } else {
-        Arc::new(StructArray::from(arrays))
+        },
+        Kind::Double => DataType::Float64,
+        Kind::Float => DataType::Float32,
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => DataType::Int32,
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => DataType::Int64,
+        Kind::Uint32 | Kind::Fixed32 => DataType::UInt32,
+        Kind::Uint64 | Kind::Fixed64 => DataType::UInt64,
+        Kind::Bool => DataType::Boolean,
+        Kind::String => DataType::Utf8,
+        Kind::Bytes => DataType::Binary,
+        Kind::Enum(_) => DataType::Int32,
     };
-    let list_data_type = DataType::List(Arc::new(Field::new(
-        "item",
-        struct_array.data_type().clone(),
-        false,
-    )));
-    let list_data: ArrayData = ArrayData::builder(list_data_type)
-        .len(messages.len())
-        .add_buffer(Buffer::from_iter(offsets))
-        .add_child_data(struct_array.to_data())
-        .build()
-        .unwrap();
-    Ok(Arc::new(ListArray::from(list_data)))
+
+    if field.is_list() {
+        DataType::List(Arc::new(Field::new("item", inner_type, false)))
+    } else {
+        inner_type
+    }
 }
 
-fn field_to_array(
+fn make_builder(data_type: &DataType, capacity: usize) -> Box<dyn ArrayBuilder> {
+    match data_type {
+        DataType::Float64 => Box::new(Float64Builder::with_capacity(capacity)),
+        DataType::Float32 => Box::new(Float32Builder::with_capacity(capacity)),
+        DataType::Int32 => Box::new(Int32Builder::with_capacity(capacity)),
+        DataType::Int64 => Box::new(Int64Builder::with_capacity(capacity)),
+        DataType::UInt32 => Box::new(UInt32Builder::with_capacity(capacity)),
+        DataType::UInt64 => Box::new(UInt64Builder::with_capacity(capacity)),
+        DataType::Boolean => Box::new(BooleanBuilder::with_capacity(capacity)),
+        DataType::Utf8 => Box::new(StringBuilder::new()),
+        DataType::Binary => Box::new(BinaryBuilder::new()),
+        DataType::Date32 => Box::new(Date32Builder::with_capacity(capacity)),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => {
+            Box::new(TimestampNanosecondBuilder::with_capacity(capacity))
+        }
+        DataType::List(field) => {
+            let values_builder = make_builder(field.data_type(), 0);
+            Box::new(ListBuilder::new(values_builder))
+        }
+        DataType::Struct(fields) => {
+            let sub_builders = fields
+                .iter()
+                .map(|f| make_builder(f.data_type(), capacity))
+                .collect();
+            Box::new(StructBuilder::new(fields.clone(), sub_builders))
+        }
+        _ => unimplemented!("Unsupported data type for builder: {:?}", data_type),
+    }
+}
+
+fn append_singular_value_to_builder(
+    builder: &mut dyn ArrayBuilder,
+    kind: &Kind,
+    value: &Value,
+) {
+    match kind {
+        Kind::Double => builder
+            .as_any_mut()
+            .downcast_mut::<Float64Builder>()
+            .unwrap()
+            .append_value(value.as_f64().unwrap()),
+        Kind::Float => builder
+            .as_any_mut()
+            .downcast_mut::<Float32Builder>()
+            .unwrap()
+            .append_value(value.as_f32().unwrap()),
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => builder
+            .as_any_mut()
+            .downcast_mut::<Int32Builder>()
+            .unwrap()
+            .append_value(value.as_i32().unwrap()),
+        Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => builder
+            .as_any_mut()
+            .downcast_mut::<Int64Builder>()
+            .unwrap()
+            .append_value(value.as_i64().unwrap()),
+        Kind::Uint32 | Kind::Fixed32 => builder
+            .as_any_mut()
+            .downcast_mut::<UInt32Builder>()
+            .unwrap()
+            .append_value(value.as_u32().unwrap()),
+        Kind::Uint64 | Kind::Fixed64 => builder
+            .as_any_mut()
+            .downcast_mut::<UInt64Builder>()
+            .unwrap()
+            .append_value(value.as_u64().unwrap()),
+        Kind::Bool => builder
+            .as_any_mut()
+            .downcast_mut::<BooleanBuilder>()
+            .unwrap()
+            .append_value(value.as_bool().unwrap()),
+        Kind::String => builder
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap()
+            .append_value(value.as_str().unwrap()),
+        Kind::Bytes => builder
+            .as_any_mut()
+            .downcast_mut::<BinaryBuilder>()
+            .unwrap()
+            .append_value(value.as_bytes().unwrap()),
+        Kind::Enum(_) => builder
+            .as_any_mut()
+            .downcast_mut::<Int32Builder>()
+            .unwrap()
+            .append_value(value.as_enum_number().unwrap()),
+        Kind::Message(message_descriptor) => {
+            if message_descriptor.full_name() == "google.protobuf.Timestamp" {
+                let msg = value.as_message().unwrap();
+                let seconds = msg.get_field_by_name("seconds").unwrap().as_i64().unwrap();
+                let nanos = msg.get_field_by_name("nanos").unwrap().as_i32().unwrap();
+                let total_nanos = seconds * 1_000_000_000 + i64::from(nanos);
+                builder
+                    .as_any_mut()
+                    .downcast_mut::<TimestampNanosecondBuilder>()
+                    .unwrap()
+                    .append_value(total_nanos);
+                return;
+            }
+            if message_descriptor.full_name() == "google.type.Date" {
+                let msg = value.as_message().unwrap();
+                let year = msg.get_field_by_name("year").unwrap().as_i32().unwrap();
+                let month = msg.get_field_by_name("month").unwrap().as_i32().unwrap();
+                let day = msg.get_field_by_name("day").unwrap().as_i32().unwrap();
+                if year == 0 && month == 0 && day == 0 {
+                    builder
+                        .as_any_mut()
+                        .downcast_mut::<Date32Builder>()
+                        .unwrap()
+                        .append_value(0);
+                } else {
+                    let date =
+                        chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32).unwrap();
+                    builder
+                        .as_any_mut()
+                        .downcast_mut::<Date32Builder>()
+                        .unwrap()
+                        .append_value(date.num_days_from_ce() - CE_OFFSET);
+                }
+                return;
+            }
+            let struct_builder = builder
+                .as_any_mut()
+                .downcast_mut::<StructBuilder>()
+                .unwrap();
+            let msg = value.as_message().unwrap();
+            for (i, sub_field) in message_descriptor.fields().enumerate() {
+                let sub_builder = &mut struct_builder.field_builders_mut()[i];
+                if sub_field.supports_presence() && !msg.has_field(&sub_field) {
+                    let dt = field_descriptor_to_data_type(&sub_field);
+                    append_null_for_builder(sub_builder.as_mut(), &dt);
+                } else {
+                    let sub_value = msg.get_field(&sub_field);
+                    append_value_to_builder(sub_builder.as_mut(), &sub_field, &sub_value);
+                }
+            }
+            struct_builder.append(true);
+        }
+    }
+}
+
+fn append_value_to_builder(
+    builder: &mut dyn ArrayBuilder,
     field_descriptor: &FieldDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<Arc<dyn Array>, &'static str> {
+    value: &Value,
+) {
     if field_descriptor.is_list() {
-        repeated_field_to_array(field_descriptor, messages)
-    } else if field_descriptor.is_map() {
-        Err("map not supported")
-    } else {
-        singular_field_to_array(field_descriptor, messages)
+        let list_builder = builder
+            .as_any_mut()
+            .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+            .unwrap();
+        if let Some(list_values) = value.as_list() {
+            for item_value in list_values {
+                append_singular_value_to_builder(list_builder.values(), &field_descriptor.kind(), item_value);
+            }
+        }
+        list_builder.append(true);
+        return;
+    }
+    append_singular_value_to_builder(builder, &field_descriptor.kind(), value);
+}
+
+fn append_null_for_builder(builder: &mut dyn ArrayBuilder, dt: &DataType) {
+    match dt {
+        DataType::Float64 => builder
+            .as_any_mut()
+            .downcast_mut::<Float64Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::Float32 => builder
+            .as_any_mut()
+            .downcast_mut::<Float32Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::Int32 => builder
+            .as_any_mut()
+            .downcast_mut::<Int32Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::Int64 => builder
+            .as_any_mut()
+            .downcast_mut::<Int64Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::UInt32 => builder
+            .as_any_mut()
+            .downcast_mut::<UInt32Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::UInt64 => builder
+            .as_any_mut()
+            .downcast_mut::<UInt64Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::Boolean => builder
+            .as_any_mut()
+            .downcast_mut::<BooleanBuilder>()
+            .unwrap()
+            .append_null(),
+        DataType::Utf8 => builder
+            .as_any_mut()
+            .downcast_mut::<StringBuilder>()
+            .unwrap()
+            .append_null(),
+        DataType::Binary => builder
+            .as_any_mut()
+            .downcast_mut::<BinaryBuilder>()
+            .unwrap()
+            .append_null(),
+        DataType::Date32 => builder
+            .as_any_mut()
+            .downcast_mut::<Date32Builder>()
+            .unwrap()
+            .append_null(),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => builder
+            .as_any_mut()
+            .downcast_mut::<TimestampNanosecondBuilder>()
+            .unwrap()
+            .append_null(),
+        DataType::List(_) => builder
+            .as_any_mut()
+            .downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>()
+            .unwrap()
+            .append_null(),
+        DataType::Struct(_) => builder
+            .as_any_mut()
+            .downcast_mut::<StructBuilder>()
+            .unwrap()
+            .append_null(),
+        _ => unimplemented!("Unsupported data type for append_null: {:?}", dt),
+    }
+}
+
+fn finish_builder(builder: &mut dyn ArrayBuilder, dt: &DataType) -> ArrayRef {
+    match dt {
+        DataType::Float64 => Arc::new(builder.as_any_mut().downcast_mut::<Float64Builder>().unwrap().finish()),
+        DataType::Float32 => Arc::new(builder.as_any_mut().downcast_mut::<Float32Builder>().unwrap().finish()),
+        DataType::Int32 => Arc::new(builder.as_any_mut().downcast_mut::<Int32Builder>().unwrap().finish()),
+        DataType::Int64 => Arc::new(builder.as_any_mut().downcast_mut::<Int64Builder>().unwrap().finish()),
+        DataType::UInt32 => Arc::new(builder.as_any_mut().downcast_mut::<UInt32Builder>().unwrap().finish()),
+        DataType::UInt64 => Arc::new(builder.as_any_mut().downcast_mut::<UInt64Builder>().unwrap().finish()),
+        DataType::Boolean => Arc::new(builder.as_any_mut().downcast_mut::<BooleanBuilder>().unwrap().finish()),
+        DataType::Utf8 => Arc::new(builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap().finish()),
+        DataType::Binary => Arc::new(builder.as_any_mut().downcast_mut::<BinaryBuilder>().unwrap().finish()),
+        DataType::Date32 => Arc::new(builder.as_any_mut().downcast_mut::<Date32Builder>().unwrap().finish()),
+        DataType::Timestamp(TimeUnit::Nanosecond, None) => Arc::new(builder.as_any_mut().downcast_mut::<TimestampNanosecondBuilder>().unwrap().finish()),
+        DataType::List(_) => Arc::new(builder.as_any_mut().downcast_mut::<ListBuilder<Box<dyn ArrayBuilder>>>().unwrap().finish()),
+        DataType::Struct(_) => Arc::new(builder.as_any_mut().downcast_mut::<StructBuilder>().unwrap().finish()),
+        _ => unimplemented!("Unsupported data type for finish_builder: {:?}", dt),
     }
 }
 
@@ -407,31 +319,50 @@ fn is_nullable(field: &FieldDescriptor) -> bool {
     field.supports_presence()
 }
 
-fn field_to_tuple(
-    field: &FieldDescriptor,
-    messages: &Vec<DynamicMessage>,
-) -> Result<(Arc<Field>, Arc<dyn Array>), &'static str> {
-    let results = field_to_array(field, messages);
-    match results {
-        Ok(array) => Ok((
-            Arc::new(Field::new(
-                field.name(),
-                array.data_type().clone(),
-                is_nullable(field),
-            )),
-            array,
-        )),
-        Err(x) => Err(x),
-    }
-}
 
 pub fn fields_to_arrays(
-    messages: &Vec<DynamicMessage>,
+    messages: &[DynamicMessage],
     message_descriptor: &MessageDescriptor,
 ) -> Vec<(Arc<Field>, Arc<dyn Array>)> {
-    message_descriptor
-        .fields()
-        .map(|x| field_to_tuple(&x, messages).unwrap())
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let fields: Vec<FieldDescriptor> = message_descriptor.fields().collect();
+
+    let mut builders: Vec<Box<dyn ArrayBuilder>> = fields
+        .iter()
+        .map(|field| {
+            let data_type = field_descriptor_to_data_type(field);
+            make_builder(&data_type, messages.len())
+        })
+        .collect();
+
+    for message in messages {
+        for (i, field) in fields.iter().enumerate() {
+            let builder = &mut builders[i];
+            if field.supports_presence() && !message.has_field(field) {
+                let dt = field_descriptor_to_data_type(field);
+                append_null_for_builder(builder.as_mut(), &dt);
+            } else {
+                let value = message.get_field(field);
+                append_value_to_builder(builder.as_mut(), field, &value);
+            }
+        }
+    }
+
+    fields
+        .iter()
+        .zip(builders.iter_mut())
+        .map(|(field, builder)| {
+            let dt = field_descriptor_to_data_type(field);
+            let arrow_field = Arc::new(Field::new(
+                field.name(),
+                dt.clone(),
+                is_nullable(field),
+            ));
+            (arrow_field, finish_builder(builder.as_mut(), &dt))
+        })
         .collect()
 }
 
